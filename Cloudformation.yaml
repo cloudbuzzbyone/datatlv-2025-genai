@@ -1,0 +1,946 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Architecture with separate S3 input/output buckets, SQS queue, Lambda functions, and Bedrock integration'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Base name for all resources
+    Default: "my-bedrock-project"
+    AllowedPattern: "[a-zA-Z0-9-]+"
+    ConstraintDescription: "Only alphanumeric characters and hyphens are allowed"
+  
+  BedrockFlowId:
+    Type: String
+    Description: ID of the Amazon Bedrock Flow to invoke
+  
+  FlowAliasId:
+    Type: String
+    Description: The alias ID of the Bedrock Flow
+    
+  BedrockModelId:
+    Type: String
+    Description: ID of the Amazon Bedrock model to use for invocations
+    Default: "anthropic.claude-3-sonnet-20240229-v1:0"
+
+Resources:
+  # SQS Queue for S3 event notifications - Create this first
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-queue'
+      MessageRetentionPeriod: 300
+      VisibilityTimeout: 300  # 5 minutes, enough time for Lambda to process
+
+  # Allow S3 to send messages to SQS - Create this second
+  ProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ProcessingQueue.Arn
+
+  # Output Bucket - No notification configuration needed
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-output-${AWS::AccountId}'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  # Input Bucket - Create after queue policy
+  InputBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ProcessingQueuePolicy
+    Properties:
+      BucketName: !Sub '${ProjectName}-input-${AWS::AccountId}'
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Queue: !GetAtt ProcessingQueue.Arn
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  # Lambda Function triggered by SQS
+  ProcessingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-s3-access-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt InputBucket.Arn
+                  - !Sub '${InputBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt OutputBucket.Arn
+                  - !Sub '${OutputBucket.Arn}/*'
+        - PolicyName: !Sub '${ProjectName}-sqs-access-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ProcessingQueue.Arn
+        - PolicyName: !Sub '${ProjectName}-bedrock-access-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeFlow
+                  - bedrock:StartFlow
+                  - bedrock:InvokeModel
+                Resource: '*'  # You can restrict this to specific Bedrock Flow ARN
+
+  ProcessingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-lambda'
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessingLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 180
+      MemorySize: 256
+      Environment:
+        Variables:
+          BEDROCK_FLOW_ID: !Ref BedrockFlowId
+          FLOW_ALIAS_ID: !Ref FlowAliasId
+          PROJECT_NAME: !Ref ProjectName
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import urllib.parse
+          
+          s3_client = boto3.client('s3')
+          bedrock_client = boto3.client('bedrock-agent-runtime')
+          
+          def lambda_handler(event, context):
+              try:
+                  # Process SQS messages
+                  for record in event['Records']:
+                      # Parse the SQS message body to get the S3 event
+                      message_body = json.loads(record['body'])
+                      
+                      # Extract S3 bucket and key from the event
+                      s3_event = message_body.get('Records', [])[0]
+                      bucket = s3_event['s3']['bucket']['name']
+                      key = urllib.parse.unquote_plus(s3_event['s3']['object']['key'])
+                      
+                      print(f"Processing new file: {key} from bucket: {bucket}")
+                      
+                      # Generate the S3 URL
+                      s3_url = f"s3://{bucket}/{key}"
+                      
+                      # Get the Bedrock Flow ID and other environment variables
+                      bedrock_flow_id = os.environ['BEDROCK_FLOW_ID']
+                      project_name = os.environ['PROJECT_NAME']
+                      flow_alias_id = os.environ['FLOW_ALIAS_ID']
+                      
+                      # Start the Bedrock Flow
+                      response = bedrock_client.invoke_flow(
+                          flowIdentifier=bedrock_flow_id,
+                          flowAliasIdentifier=flow_alias_id,
+                          inputs=[
+                              {
+                                  "content": {
+                                      "document": {
+                                          "source_object_key": key,
+                                          "project_name": project_name,
+                                          "input_bucket": bucket,
+                                          "dest_object_key": key+".json"
+                                      }
+                                  },
+                                  "nodeName": "FlowInputNode",
+                                  "nodeOutputName": "document"
+                              }
+                          ]
+                      )
+                      
+                      print(f"Started Bedrock Flow with execution ID: {response['executionId']}")
+                      
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Processing completed successfully')
+                  }
+              except Exception as e:
+                  print(f"Error processing message: {str(e)}")
+                  raise e
+
+  # Set up the Lambda to be triggered by the SQS queue
+  LambdaSQSMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt ProcessingQueue.Arn
+      FunctionName: !GetAtt ProcessingLambda.Arn
+
+  # IAM Role for Bedrock Flow to access S3
+  BedrockFlowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-bedrock-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-bedrock-flows-access-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt InputBucket.Arn
+                  - !Sub '${InputBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt OutputBucket.Arn
+                  - !Sub '${OutputBucket.Arn}/*'
+              - Effect: Allow
+                Action: 
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub '${S3PDFtoTextLambda.Arn}*'
+                  - !Sub '${AdvancedLambda.Arn}*'
+              - Effect: Allow
+                Action:
+                  - bedrock:CreatePrompt
+                  - bedrock:UpdatePrompt
+                  - bedrock:GetPrompt
+                  - bedrock:ListPrompts
+                  - bedrock:DeletePrompt
+                  - bedrock:CreatePromptVersion
+                  - bedrock:OptimizePrompt
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetInferenceProfile
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:RenderPrompt
+                  - bedrock:TagResource
+                  - bedrock:UntagResource
+                  - bedrock:ListTagsForResource
+                Resource: "*"
+
+  # Additional Lambda 1: S3 to Bedrock Lambda
+  S3PDFtoTextLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-s3-pdf-to-text-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-s3-access-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt InputBucket.Arn
+                  - !Sub '${InputBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt OutputBucket.Arn
+                  - !Sub '${OutputBucket.Arn}/*'
+        - PolicyName: !Sub '${ProjectName}-bedrock-access-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+        - PolicyName: !Sub '${ProjectName}-s3-pdf-to-text-cloudwatch-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-s3-pdf-to-text-lambda:*'
+
+  # CloudWatch Log Group for S3PDFtoText Lambda
+  S3PDFtoTextLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-s3-pdf-to-text-lambda'
+      RetentionInDays: 30
+
+  S3PDFtoTextLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: S3PDFtoTextLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-s3-pdf-to-text-lambda'
+      Handler: index.lambda_handler
+      Role: !GetAtt S3PDFtoTextLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import traceback
+          import re
+          import io
+          import sys
+          import subprocess
+
+          # Initialize AWS clients
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              """
+              Lambda function that downloads a PDF from S3 and extracts its text.
+              
+              Expected event format:
+              {
+                  "object_key": "path/to/tender.pdf",
+                  "input_bucket": "my-input-bucket-name"
+              }
+              
+              Returns the extracted text that can be used by a second Lambda function.
+              """
+              try:
+                  print(f"Received event: {json.dumps(event)}")
+                  
+                  try:
+                      value = event['node']['inputs'][0]['value']
+                  except (KeyError, IndexError) as e:
+                      # handle missing structure
+                      raise ValueError("Unexpected event structure") from e
+                  
+                  # Extract parameters from the event
+                  object_key = value.get('source_object_key')
+                  input_bucket = value.get('input_bucket')
+                  
+                  # Validate input parameters
+                  if not object_key or not input_bucket:
+                      error_msg = "Missing required parameters: object_key and/or input_bucket"
+                      print(error_msg)
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Check if file is a PDF
+                  if not object_key.lower().endswith('.pdf'):
+                      error_msg = f"File {object_key} is not a PDF"
+                      print(error_msg)
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Get the PDF file from S3
+                  print(f"Downloading PDF: {object_key} from bucket: {input_bucket}")
+                  try:
+                      response = s3_client.get_object(Bucket=input_bucket, Key=object_key)
+                      file_content = response['Body'].read()
+                  except Exception as e:
+                      error_msg = f"Error downloading PDF from S3: {str(e)}"
+                      print(error_msg)
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Install pdfplumber at runtime (only on first execution)
+                  ensure_pdfplumber_installed()
+                  
+                  # Now we can safely import pdfplumber
+                  import pdfplumber
+                  
+                  # Extract text from the PDF using pdfplumber
+                  print("Extracting text from PDF")
+                  pdf_text = extract_text_with_pdfplumber(file_content)
+                  if not pdf_text:
+                      error_msg = "Could not extract text from PDF. The file may be empty or corrupted."
+                      print(error_msg)
+                      return {
+                          'statusCode': 422,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  print(f"Extracted {len(pdf_text)} characters from PDF")
+                  
+                  # Return the extracted text and file metadata
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'PDF text extracted successfully',
+                          'input_pdf': f"s3://{input_bucket}/{object_key}",
+                          'object_key': object_key,
+                          'pdf_text': pdf_text
+                      }, ensure_ascii=False)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing PDF: {str(e)}")
+                  print(traceback.format_exc())
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f"Internal error: {str(e)}"})
+                  }
+
+          def ensure_pdfplumber_installed():
+              """
+              Ensure pdfplumber and its dependencies are installed
+              This avoids the need for a Lambda layer
+              """
+              # Only install if not already installed
+              try:
+                  import pdfplumber
+                  print("pdfplumber already installed")
+                  return
+              except ImportError:
+                  print("Installing pdfplumber and dependencies...")
+                  
+              # Use pip to install the package to /tmp
+              tmp_dir = "/tmp/pdfplumber_packages"
+              
+              # Make sure the directory exists
+              if not os.path.exists(tmp_dir):
+                  os.makedirs(tmp_dir)
+              
+              # Install pdfplumber and its dependencies
+              subprocess.check_call([
+                  sys.executable, 
+                  "-m", 
+                  "pip", 
+                  "install", 
+                  "--target", 
+                  tmp_dir, 
+                  "pdfplumber"
+              ])
+              
+              # Add the directory to sys.path
+              sys.path.insert(0, tmp_dir)
+              
+              # Verify installation
+              try:
+                  import pdfplumber
+                  print(f"pdfplumber version {pdfplumber.__version__} installed successfully")
+              except ImportError as e:
+                  print(f"Failed to import pdfplumber after installation: {str(e)}")
+                  raise
+
+          def extract_text_with_pdfplumber(pdf_content):
+              """
+              Extract text from a PDF file using pdfplumber, which has better support for RTL languages
+              like Hebrew than PyPDF2
+              """
+              import pdfplumber
+              
+              try:
+                  # Create a BytesIO object from the PDF content
+                  pdf_file = io.BytesIO(pdf_content)
+                  
+                  # Open the PDF with pdfplumber
+                  with pdfplumber.open(pdf_file) as pdf:
+                      text = ""
+                      # Extract text from each page
+                      for page in pdf.pages:
+                          page_text = page.extract_text(x_tolerance=2, y_tolerance=2)
+                          if page_text:
+                              text += page_text + "\n"
+                  
+                  return text
+              except Exception as e:
+                  print(f"Error extracting text from PDF with pdfplumber: {str(e)}")
+                  print(traceback.format_exc())
+                  return None
+
+  # Additional Lambda 2: Advanced Lambda
+  AdvancedLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-Advanced-lambda-role' 
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-s3-access-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt InputBucket.Arn
+                  - !Sub '${InputBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt OutputBucket.Arn
+                  - !Sub '${OutputBucket.Arn}/*'
+        - PolicyName: !Sub '${ProjectName}-bedrock-access-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+        - PolicyName: !Sub '${ProjectName}-Advanced-cloudwatch-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-Advanced-lambda:*'
+
+  # CloudWatch Log Group for Advanced Lambda
+  AdvancedLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-Advanced-lambda'
+      RetentionInDays: 30
+
+  AdvancedLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: AdvancedLogGroup
+    Properties:
+      FunctionName: !Sub '${ProjectName}-Advanced-lambda'
+      Handler: index.lambda_handler
+      Role: !GetAtt AdvancedLambdaRole.Arn
+      Runtime: python3.11
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import traceback
+          import re
+          import io
+          import sys
+          import subprocess
+
+          # Initialize AWS clients
+          s3_client = boto3.client('s3')
+          bedrock_client = boto3.client('bedrock-runtime')
+
+
+          def lambda_handler(event, context):
+              """
+              Lambda function that downloads a PDF from S3 and extracts its text.
+              
+              Expected event format:
+              {
+                  "object_key": "path/to/tender.pdf",
+                  "input_bucket": "my-input-bucket-name"
+              }
+              
+              Returns the extracted text that can be used by a second Lambda function.
+              """
+              try:
+                  print(f"Received event: {json.dumps(event)}")
+                  
+                  try:
+                      value = event['node']['inputs'][0]['value']
+                  except (KeyError, IndexError) as e:
+                      # handle missing structure
+                      raise ValueError("Unexpected event structure") from e
+                  
+                  # Extract parameters from the event
+                  object_key = value.get('source_object_key')
+                  input_bucket = value.get('input_bucket')
+                  
+                  # Validate input parameters
+                  if not object_key or not input_bucket:
+                      error_msg = "Missing required parameters: object_key and/or input_bucket"
+                      print(error_msg)
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Check if file is a PDF
+                  if not object_key.lower().endswith('.pdf'):
+                      error_msg = f"File {object_key} is not a PDF"
+                      print(error_msg)
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Get the PDF file from S3
+                  print(f"Downloading PDF: {object_key} from bucket: {input_bucket}")
+                  try:
+                      response = s3_client.get_object(Bucket=input_bucket, Key=object_key)
+                      file_content = response['Body'].read()
+                  except Exception as e:
+                      error_msg = f"Error downloading PDF from S3: {str(e)}"
+                      print(error_msg)
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  # Install pdfplumber at runtime (only on first execution)
+                  ensure_pdfplumber_installed()
+                  
+                  # Now we can safely import pdfplumber
+                  import pdfplumber
+                  
+                  # Extract text from the PDF using pdfplumber
+                  print("Extracting text from PDF")
+                  pdf_text = extract_text_with_pdfplumber(file_content)
+                  if not pdf_text:
+                      error_msg = "Could not extract text from PDF. The file may be empty or corrupted."
+                      print(error_msg)
+                      return {
+                          'statusCode': 422,
+                          'body': json.dumps({'error': error_msg})
+                      }
+                  
+                  print(f"Extracted {len(pdf_text)} characters from PDF")
+                  
+                  # Get the Bedrock model ID
+                  model_id = os.environ['BEDROCK_MODEL_ID']
+                  
+                  # Prepare the prompt based on Advanced type
+                  prompt = "Here is a the content of a Hebrew PDF containing a Tender deduct key elemnts and extract them into a json file, output should be json file content only. here is the content:"
+
+                  formatted_prompt = f"{prompt}\n\n{pdf_text}"
+                  
+                  # Invoke Bedrock model
+                  print(f"Invoking Bedrock model: {model_id}")
+                  bedrock_payload = {
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 1000,
+                      "messages": [
+                          {
+                              "role": "user",
+                              "content": [
+                                  {
+                                      "type": "text",
+                                      "text": formatted_prompt
+                                  }
+                              ]
+                          }
+                      ]
+                  }
+                  
+                  invoke_response = bedrock_client.invoke_model(
+                      modelId=model_id,
+                      contentType='application/json',
+                      accept='application/json',
+                      body=json.dumps(bedrock_payload)
+                  )
+                  
+                  # Process the response
+                  response_body = json.loads(invoke_response['body'].read())
+                  summary = response_body['content'][0]['text']
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'summary': summary,
+                          'summary_type': Advanced_type
+                      }
+                  }
+                  
+                  # Return the extracted text and file metadata
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'PDF text extracted successfully',
+                          'input_pdf': f"s3://{input_bucket}/{object_key}",
+                          'object_key': object_key,
+                          'pdf_text': pdf_text
+                          'prompt_result': summary
+                      }, ensure_ascii=False)
+                  }
+                  
+              except Exception as e:
+                  print(f"Error processing PDF: {str(e)}")
+                  print(traceback.format_exc())
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': f"Internal error: {str(e)}"})
+                  }
+
+          def ensure_pdfplumber_installed():
+              """
+              Ensure pdfplumber and its dependencies are installed
+              This avoids the need for a Lambda layer
+              """
+              # Only install if not already installed
+              try:
+                  import pdfplumber
+                  print("pdfplumber already installed")
+                  return
+              except ImportError:
+                  print("Installing pdfplumber and dependencies...")
+                  
+              # Use pip to install the package to /tmp
+              tmp_dir = "/tmp/pdfplumber_packages"
+              
+              # Make sure the directory exists
+              if not os.path.exists(tmp_dir):
+                  os.makedirs(tmp_dir)
+              
+              # Install pdfplumber and its dependencies
+              subprocess.check_call([
+                  sys.executable, 
+                  "-m", 
+                  "pip", 
+                  "install", 
+                  "--target", 
+                  tmp_dir, 
+                  "pdfplumber"
+              ])
+              
+              # Add the directory to sys.path
+              sys.path.insert(0, tmp_dir)
+              
+              # Verify installation
+              try:
+                  import pdfplumber
+                  print(f"pdfplumber version {pdfplumber.__version__} installed successfully")
+              except ImportError as e:
+                  print(f"Failed to import pdfplumber after installation: {str(e)}")
+                  raise
+
+          def extract_text_with_pdfplumber(pdf_content):
+              """
+              Extract text from a PDF file using pdfplumber, which has better support for RTL languages
+              like Hebrew than PyPDF2
+              """
+              import pdfplumber
+              
+              try:
+                  # Create a BytesIO object from the PDF content
+                  pdf_file = io.BytesIO(pdf_content)
+                  
+                  # Open the PDF with pdfplumber
+                  with pdfplumber.open(pdf_file) as pdf:
+                      text = ""
+                      # Extract text from each page
+                      for page in pdf.pages:
+                          page_text = page.extract_text(x_tolerance=2, y_tolerance=2)
+                          if page_text:
+                              text += page_text + "\n"
+                  
+                  return text
+              except Exception as e:
+                  print(f"Error extracting text from PDF with pdfplumber: {str(e)}")
+                  print(traceback.format_exc())
+                  return None
+
+
+
+
+
+          
+          
+          def lambda_handler(event, context):
+              try:
+                  print(f"Received event: {json.dumps(event)}")
+                 
+                  # Extract the content from the event
+                  content = event.get('content')
+                  Advanced_type = event.get('Advanced_type', 'default')
+                  
+                  if not content:
+                    return {
+                        'statusCode': 400,
+                        'body': json.dumps('Missing required parameter: content')
+                    }
+                
+                  # Get the Bedrock model ID
+                  model_id = os.environ['BEDROCK_MODEL_ID']
+                  
+                  # Prepare the prompt based on Advanced type
+                  prompt = "Summarize the following text concisely:"
+                  
+                  if Advanced_type == 'executive':
+                      prompt = "Create an executive summary of the following text:"
+                  elif Advanced_type == 'bullets':
+                      prompt = "Summarize the following text as bullet points highlighting key takeaways:"
+                  elif Advanced_type == 'detailed':
+                      prompt = "Create a detailed summary of the following text preserving key information and insights:"
+                  
+                  formatted_prompt = f"{prompt}\n\n{content}"
+                  
+                  # Invoke Bedrock model
+                  print(f"Invoking Bedrock model: {model_id}")
+                  bedrock_payload = {
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 1000,
+                      "messages": [
+                          {
+                              "role": "user",
+                              "content": [
+                                  {
+                                      "type": "text",
+                                      "text": formatted_prompt
+                                  }
+                              ]
+                          }
+                      ]
+                  }
+                  
+                  invoke_response = bedrock_client.invoke_model(
+                      modelId=model_id,
+                      contentType='application/json',
+                      accept='application/json',
+                      body=json.dumps(bedrock_payload)
+                  )
+                  
+                  # Process the response
+                  response_body = json.loads(invoke_response['body'].read())
+                  summary = response_body['content'][0]['text']
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': {
+                          'summary': summary,
+                          'summary_type': Advanced_type
+                      }
+                  }
+              except Exception as e:
+                  print(f"Error processing message: {str(e)}")
+                  print(traceback.format_exc())
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+Outputs:
+  InputBucketName:
+    Description: Name of the S3 input bucket
+    Value: !Ref InputBucket
+  
+  OutputBucketName:
+    Description: Name of the S3 output bucket
+    Value: !Ref OutputBucket
+  
+  QueueURL:
+    Description: URL of the SQS queue
+    Value: !Ref ProcessingQueue
+  
+  QueueARN:
+    Description: ARN of the SQS queue
+    Value: !GetAtt ProcessingQueue.Arn
+  
+  LambdaFunction:
+    Description: Name of the Lambda function
+    Value: !Ref ProcessingLambda
+  
+  S3PDFtoTextLambdaName:
+    Description: Name of the S3 to Bedrock Lambda function
+    Value: !Ref S3PDFtoTextLambda
+    
+  S3PDFtoTextLambdaArn:
+    Description: ARN of the S3 to Bedrock Lambda function
+    Value: !GetAtt S3PDFtoTextLambda.Arn
+    
+  AdvancedLambdaName:
+    Description: Name of the Advanced Lambda function
+    Value: !Ref AdvancedLambda
+    
+  AdvancedLambdaArn:
+    Description: ARN of the Advanced Lambda function
+    Value: !GetAtt AdvancedLambda.Arn
+  
+  BedrockFlowRoleARN:
+    Description: ARN of the IAM role for Bedrock Flow
+    Value: !GetAtt BedrockFlowRole.Arn
+  
+  S3PDFtoTextLogGroupName:
+    Description: Name of the S3 to Bedrock Lambda's CloudWatch Log Group
+    Value: !Ref S3PDFtoTextLogGroup
+  
+  AdvancedLogGroupName:
+    Description: Name of the Advanced Lambda's CloudWatch Log Group
+    Value: !Ref AdvancedLogGroup
